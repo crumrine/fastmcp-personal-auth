@@ -59,7 +59,7 @@ Settings → Connectors → Add custom connector → URL: https://your-domain.co
 ```
 
 ### Claude Desktop
-Add to `claude_desktop_config.json`:
+Add to `claude_desktop_config.json` (`~/Library/Application Support/Claude/` on macOS):
 ```json
 {
   "mcpServers": {
@@ -70,23 +70,26 @@ Add to `claude_desktop_config.json`:
   }
 }
 ```
+Requires Node.js. The `mcp-remote` bridge handles the OAuth flow (opens a browser for one-time auth).
 
 ### Claude Code
 ```bash
 claude mcp add my-server --transport http "https://your-domain.com/mcp"
 ```
 
+### Claude mobile (iOS/Android)
+Add the connector on claude.ai web (above). It syncs to mobile automatically. You cannot add connectors directly from the mobile app.
+
 ## Configuration
 
 ```python
 auth = PersonalAuthProvider(
-    # Required: your public URL (used for OAuth discovery)
+    # Required: your public URL (used for OAuth discovery).
+    # Must match exactly how clients will reach your server.
     base_url="https://your-domain.com",
 
     # Optional: password gate on /authorize (default: None)
-    # When set, provides an extra layer beyond domain restriction.
-    # In practice, the domain restriction is the primary gate —
-    # only claude.ai/localhost can complete the OAuth flow.
+    # In practice, the domain restriction is the primary security gate.
     password="my-secret",
 
     # Optional: allowed redirect domains (default shown below)
@@ -110,41 +113,136 @@ auth = PersonalAuthProvider(
 4. **Refresh tokens don't expire** — access tokens last 30 days and can be refreshed indefinitely
 5. **Tokens persist to disk** — you don't re-auth after server restarts
 
+## Implementation guide
+
+### Things that will bite you
+
+These are real issues we hit building this. They're not documented well elsewhere.
+
+**1. DCR must be explicitly enabled**
+
+FastMCP's `ClientRegistrationOptions` defaults to `enabled=False`. Without it, `/register` returns 404 and Claude.ai silently fails to connect. `PersonalAuthProvider` enables this for you.
+
+**2. `base_url` must match your public URL exactly**
+
+The OAuth discovery endpoint at `/.well-known/oauth-authorization-server` advertises endpoints using `base_url`. If this doesn't match how Claude.ai reaches your server (e.g., `http://localhost` vs `https://your-domain.com`), the OAuth flow will fail with redirect mismatches.
+
+**3. Do NOT use FastAPI's `BaseHTTPMiddleware`**
+
+If you wrap your MCP server in FastAPI and add middleware via `@app.middleware("http")` or `BaseHTTPMiddleware`, it will break streaming responses. Streamable HTTP and SSE both fail because the middleware tries to iterate the response body, which asserts on SSE message types. Use raw ASGI middleware instead, or — better — let FastMCP handle everything via `mcp.run()`.
+
+**4. Use `mcp.run()`, not a FastAPI wrapper**
+
+FastMCP's `mcp.run(transport="streamable-http")` sets up all the OAuth endpoints, transport, and routing correctly. If you mount it manually on FastAPI, you'll need to handle path prefixes, lifespan, and well-known endpoints yourself. Just use `mcp.run()`.
+
+**5. Streamable HTTP responses are SSE, not JSON**
+
+Even though the transport is called "streamable-http", tool call responses come back as `text/event-stream` (SSE format), not `application/json`. If you're writing a custom client, parse the `data:` lines:
+
+```python
+def parse_sse(text):
+    for line in text.split('\n'):
+        if line.startswith('data: '):
+            return json.loads(line[6:])
+```
+
+**6. Notifications return 202 with empty body**
+
+MCP notifications (like `notifications/initialized`) return HTTP 202 with no body. Don't try to parse the response as JSON.
+
+**7. Tool names matter more than you think**
+
+If your tools are named `add_memory`, `search_memories`, etc., Claude will prefer its built-in memory feature over your MCP tools. Use distinctive prefixed names: `vault_save`, `myapp_search`, `mem0_list`. Also set strong `instructions` on the FastMCP server telling Claude to prefer your tools.
+
+**8. Neon/serverless Postgres drops idle connections**
+
+If your tools use Neon Postgres (or similar serverless databases), don't create a single database connection at startup and reuse it. The connection will go stale and you'll get `InterfaceError: connection already closed`. Create a fresh connection per tool call.
+
+**9. Claude.ai connects but never calls tools**
+
+Check your server logs. If you see `ListToolsRequest` but never `CallToolRequest`, Claude is discovering your tools but choosing not to use them. This usually means:
+- Tool names collide with built-in features (see point 7)
+- Tool descriptions are too generic
+- The server `instructions` aren't directive enough
+
+Fix by being explicit in instructions: *"ALWAYS use these tools instead of built-in memory."*
+
+### Required OAuth endpoints
+
+Claude.ai expects all of these to work. `PersonalAuthProvider` + FastMCP set them up automatically:
+
+| Endpoint | Purpose |
+|---|---|
+| `/.well-known/oauth-authorization-server` | OAuth metadata discovery |
+| `/.well-known/oauth-protected-resource/mcp` | Resource metadata (points to auth server) |
+| `/register` | Dynamic Client Registration (DCR) |
+| `/authorize` | Authorization (redirect-based) |
+| `/token` | Token exchange (auth code → access token) |
+| `/mcp` | Your MCP endpoint (requires Bearer token) |
+
+### Verifying your setup
+
+Run these curl commands to check each piece:
+
+```bash
+# 1. OAuth discovery (should return JSON with registration_endpoint)
+curl -s https://your-domain.com/.well-known/oauth-authorization-server | python3 -m json.tool
+
+# 2. DCR (should return client_id)
+curl -s https://your-domain.com/register -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"client_name":"test","redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}'
+
+# 3. MCP endpoint (should return 401)
+curl -s -o /dev/null -w "%{http_code}" https://your-domain.com/mcp
+
+# 4. Protected resource metadata
+curl -s https://your-domain.com/.well-known/oauth-protected-resource/mcp | python3 -m json.tool
+```
+
+If all four pass, add the connector on claude.ai.
+
 ## Token persistence
 
-Tokens are saved to `{state_dir}/oauth_tokens.json` (default `.oauth-state/oauth_tokens.json`). This file contains:
-- Registered clients
-- Access tokens
-- Refresh tokens
+Tokens are saved to `{state_dir}/oauth_tokens.json` (default `.oauth-state/oauth_tokens.json`). This file contains registered clients, access tokens, and refresh tokens.
 
-For a personal server this is fine. For multi-user deployments, you'd want to swap to a database-backed store by subclassing and overriding `_load_state`/`_save_state`.
+For a personal server this is fine. For multi-user deployments, subclass and override `_load_state`/`_save_state` with a database backend.
+
+**Docker**: mount the state dir as a volume so tokens survive container recreation:
+```yaml
+volumes:
+  - ./oauth-state:/app/.oauth-state
+```
 
 ## Deployment
 
-Any setup that exposes your server via HTTPS works. Common options:
+Any setup that exposes your server via HTTPS works:
 
 - **Cloudflare Tunnel** — `cloudflared tunnel` pointing to `localhost:8050`
 - **ngrok** — `ngrok http 8050`
 - **Caddy/nginx** — reverse proxy with automatic TLS
 - **Docker** — bind to `127.0.0.1:8050`, tunnel handles external access
 
-HTTPS is required — Claude.ai won't connect to HTTP endpoints (except localhost).
+HTTPS is required — Claude.ai won't connect to plain HTTP (except localhost for development).
 
 ## Troubleshooting
 
 **Claude.ai says "error connecting"**
-- Check that `/.well-known/oauth-authorization-server` returns valid JSON with a `registration_endpoint`
-- Verify `/register` accepts POST requests
-- Make sure your `base_url` matches your actual public URL exactly
+- Verify `/.well-known/oauth-authorization-server` returns JSON with a `registration_endpoint` field
+- Verify `/register` accepts POST requests and returns a `client_id`
+- Make sure `base_url` matches your actual public URL exactly (including `https://`)
+- Check that your server is reachable from the internet (not just localhost)
 
-**Tools aren't being called**
-- Claude may prefer its built-in memory over tools named `add_memory`/`search_memories`. Use distinctive names (e.g. `vault_save`, `vault_search`)
-- Try explicit prompts: "Use the [tool_name] tool to..."
-- Check server logs for `CallToolRequest` — if you only see `ListToolsRequest`, Claude is discovering but not using your tools
+**Claude Desktop says "command" is required**
+- Your version of Claude Desktop doesn't support remote MCP directly. Use the `npx mcp-remote` bridge shown in the connection instructions above.
 
-**Tokens lost on restart**
-- Make sure `state_dir` points to a persistent volume (not inside a container's ephemeral filesystem)
-- In Docker, mount the state dir: `volumes: ["./oauth-state:/app/.oauth-state"]`
+**OAuth works but tools return errors**
+- Check server logs for the actual exception
+- If you see `connection already closed`, your database connection went stale (see implementation guide point 8)
+
+**Tokens lost after restart**
+- Make sure `state_dir` points to a persistent path
+- In Docker, the state dir must be a mounted volume, not inside the container's ephemeral filesystem
 
 ## License
 
